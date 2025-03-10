@@ -57,7 +57,7 @@ jobs:
           echo "installer_path=${installer_path}" >> "${GITHUB_OUTPUT}"
           echo "installer_name=${installer_path##*/}" >> "${GITHUB_OUTPUT}"
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.installer_name}}
           path: ${{ steps.package.outputs.installer_path}}
