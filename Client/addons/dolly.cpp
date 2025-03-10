@@ -3,9 +3,14 @@
 #include "../imgui/imgui.h"
 #include "../menu.h"
 #include "../pattern.h"
+#include "../settings.h"
 #include "dolly.h"
+#include <fstream>
+#include <shlobj.h>
 
-static auto recording = false, playing = false, cameraView = false;
+static auto recording = false, playing = false, cameraView = false, pathDisplay = true;
+
+static bool ToggleResetKeybinds = false;
 
 static int duration = 0, frame = 0;
 static std::vector<Dolly::Marker> markers;
@@ -19,11 +24,57 @@ static byte forceRollPatchOriginal[6];
 
 static bool hideQueued = false;
 
+static unsigned long oldProtect;
+
+static int MarkerKeybind = 0;
+static int RecordKeybind = 0;
+static int JumpFramesKeybind = 0;
+static int StartStopKeybind = 0;
+static int FOVKeybindU = 0;
+static int RollKeybindU = 0;
+static int FOVKeybindD = 0;
+static int RollKeybindD = 0;
+
+static int FrameJumpAmount = 100;
+static int FOVDegAmount = 1;
+static int RollDegAmount = 1;
+
+std::string GetAppDataPath() {
+    char path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
+        return std::string(path) + "\\MMultiplayer\\";
+    }
+    return "";
+}
+
 void Dolly::ForceRoll(bool force) {
     if (force) {
         memcpy(forceRollPatch, "\x90\x90\x90\x90\x90\x90", 6);
     } else {
         memcpy(forceRollPatch, forceRollPatchOriginal, 6);
+    }
+}
+
+void SaveMarkers();
+void LoadMarkers();
+void SaveRecordings();
+void LoadRecordings();
+
+static void ProcessHotkey(const char *label, int *key, const std::vector<std::string> settings, const int defaultValue) {
+    if (settings.empty()) {
+        return;
+    }
+
+    if (ImGui::Hotkey(label, key)) {
+        Settings::SetSetting(settings, *key);
+    }
+
+    if (ToggleResetKeybinds) {
+        ImGui::SameLine();
+
+        if (ImGui::Button(("Reset##" + settings.back()).c_str())) {
+            Settings::SetSetting(settings, *key = defaultValue);
+        }
     }
 }
 
@@ -168,6 +219,46 @@ static void FixPlayer() {
     }
 }
 
+static void AddMarker() {
+    auto pawn = Engine::GetPlayerPawn();
+    auto controller = Engine::GetPlayerController();
+    if (pawn && controller) {
+        Dolly::Marker marker(frame, controller->PlayerCamera->GetFOVAngle(), pawn->Location,
+                             RotatorToVector(pawn->Controller->Rotation));
+
+        auto replaced = false;
+        for (auto &m : markers) {
+            if (m.Frame == marker.Frame) {
+                m = marker;
+                replaced = true;
+                break;
+            }
+        }
+
+        if (!replaced) {
+            markers.push_back(marker);
+        }
+
+        if (marker.Frame < 0) {
+            ShiftTimeline(-marker.Frame);
+        }
+
+        FixTimeline();
+    }
+}
+
+static void JumpFrames(int toJump) 
+{
+    if (frame + toJump > duration) {
+        frame = duration;
+        return;
+    } else if (frame + toJump < 0) {
+        frame = 0;
+        return;
+    }
+    frame += toJump; 
+}
+
 static void DollyTab() {
     auto pawn = Engine::GetPlayerPawn();
     auto controller = Engine::GetPlayerController();
@@ -197,6 +288,9 @@ static void DollyTab() {
     if (ImGui::Checkbox("Camera View##dolly", &cameraView)) {
         FixPlayer();
     }
+
+    ImGui::SameLine();
+    ImGui::Checkbox("Display Dolly Path##dolly", &pathDisplay);
 
     ImGui::SameLine();
     ImGui::Text("|");
@@ -245,29 +339,7 @@ static void DollyTab() {
 
     ImGui::SameLine();
     if (ImGui::Button("Add Marker##dolly")) {
-        if (pawn && controller) {
-            Dolly::Marker marker(frame, controller->PlayerCamera->GetFOVAngle(), pawn->Location,
-                                 RotatorToVector(pawn->Controller->Rotation));
-
-            auto replaced = false;
-            for (auto &m : markers) {
-                if (m.Frame == marker.Frame) {
-                    m = marker;
-                    replaced = true;
-                    break;
-                }
-            }
-
-            if (!replaced) {
-                markers.push_back(marker);
-            }
-
-            if (marker.Frame < 0) {
-                ShiftTimeline(-marker.Frame);
-            }
-
-            FixTimeline();
-        }
+        AddMarker();
     }
 
     ImGui::SliderInt("Timeline##dolly", &frame, 0, duration);
@@ -323,6 +395,16 @@ static void DollyTab() {
                 FixTimeline();
             }
         }
+        
+        if (ImGui::Button("Save Markers")) {
+            SaveMarkers();
+        }
+
+        
+        if (ImGui::Button("Load Markers")) {
+            LoadMarkers();
+            FixTimeline();
+        }
     }
 
     if (ImGui::CollapsingHeader("Recordings##dolly")) {
@@ -359,6 +441,137 @@ static void DollyTab() {
                 FixTimeline();
             }
         }
+        
+        if (ImGui::Button("Save Recordings")) {
+            SaveRecordings();
+        }
+
+       
+        if (ImGui::Button("Load Recordings")) {
+            LoadRecordings();
+            FixTimeline();
+        }
+    }
+
+     ImGui::SeparatorText("Keybinds##Keybinds-Separator");
+    {
+        ImGui::Checkbox("Toggle Reset Keybinds##Keybinds-ToggleResetKeybinds",
+                        &ToggleResetKeybinds);
+        ImGui::Separator(5.0f);
+
+        // The last 2 parameters in ProcessHotkey needs to match the one in Initialize() function!
+        ProcessHotkey("Add Marker##Dolly-maker", &MarkerKeybind, {"Dolly", "Tools", "MarkerKeybind"}, VK_F5);
+        ProcessHotkey("Jump Frames (hold ctrl to jump back)##Dolly-jumpframes", &JumpFramesKeybind,{"Dolly", "Tools", "JumpFramesKeybind"}, VK_F6);
+        ProcessHotkey("Start/stop##Dolly-startstop", &StartStopKeybind,{"Dolly", "Tools", "StartStopKeybind"}, VK_F7);
+        ProcessHotkey("Start/stop Recording##Dolly-record", &RecordKeybind, {"Dolly", "Tools", "RecordKeybind"}, VK_F9);
+        ProcessHotkey("Field Of View##Dolly-FOV", &FOVKeybindU, {"Dolly", "Tools", "FOVKeybind"}, VK_OEM_MINUS);
+        ProcessHotkey("Field Of View##Dolly-FOV", &RollKeybindU, {"Dolly", "Tools", "RollKeybind"}, VK_LEFT);
+        ProcessHotkey("Field Of View##Dolly-FOV", &FOVKeybindD, {"Dolly", "Tools", "FOVKeybind"}, VK_OEM_PLUS);
+        ProcessHotkey("Field Of View##Dolly-FOV", &RollKeybindD, {"Dolly", "Tools", "RollKeybind"}, VK_RIGHT);
+
+        if (ImGui::InputInt("Frame Jump Amount##dolly", &FrameJumpAmount)) {
+            Settings::SetSetting({"Dolly", "Tools", "FrameJumpAmount"}, FrameJumpAmount);
+        }
+    }
+}
+
+void SaveMarkers() {
+    std::string path = GetAppDataPath() + "markers.dat";
+    std::ofstream outFile(path, std::ios::binary);
+    if (outFile.is_open()) {
+        size_t markerCount = markers.size();
+        outFile.write(reinterpret_cast<char *>(&markerCount), sizeof(markerCount));
+        for (const auto &marker : markers) {
+            outFile.write(reinterpret_cast<const char *>(&marker.Frame), sizeof(marker.Frame));
+            outFile.write(reinterpret_cast<const char *>(&marker.FOV), sizeof(marker.FOV));
+            outFile.write(reinterpret_cast<const char *>(&marker.Position),
+                          sizeof(marker.Position));
+            outFile.write(reinterpret_cast<const char *>(&marker.Rotation),
+                          sizeof(marker.Rotation));
+        }
+        outFile.close();
+    }
+}
+
+void LoadMarkers() {
+    std::string path = GetAppDataPath() + "markers.dat";
+    std::ifstream inFile(path, std::ios::binary);
+    if (inFile.is_open()) {
+        size_t markerCount;
+        inFile.read(reinterpret_cast<char *>(&markerCount), sizeof(markerCount));
+
+        markers.clear();
+        for (size_t i = 0; i < markerCount; ++i) {
+            int frame;
+            float fov;
+            Classes::FVector position;
+            Classes::FVector rotation;
+
+            inFile.read(reinterpret_cast<char *>(&frame), sizeof(frame));
+            inFile.read(reinterpret_cast<char *>(&fov), sizeof(fov));
+            inFile.read(reinterpret_cast<char *>(&position), sizeof(position));
+            inFile.read(reinterpret_cast<char *>(&rotation), sizeof(rotation));
+
+            Dolly::Marker marker(frame, fov, position, rotation);
+            markers.push_back(marker);
+        }
+        inFile.close();
+    }
+}
+
+void SaveRecordings() {
+    std::string path = GetAppDataPath() + "recordings.dat";
+    std::ofstream outFile(path, std::ios::binary);
+    if (outFile.is_open()) {
+        size_t recordingCount = recordings.size();
+        outFile.write(reinterpret_cast<char *>(&recordingCount), sizeof(recordingCount));
+        for (const auto &recording : recordings) {
+            outFile.write(reinterpret_cast<const char *>(&recording.StartFrame),
+                          sizeof(recording.StartFrame));
+            outFile.write(reinterpret_cast<const char *>(&recording.Character),
+                          sizeof(recording.Character));
+            size_t frameCount = recording.Frames.size();
+            outFile.write(reinterpret_cast<char *>(&frameCount), sizeof(frameCount));
+            for (const auto &frame : recording.Frames) {
+                outFile.write(reinterpret_cast<const char *>(&frame.Position),
+                              sizeof(frame.Position));
+                outFile.write(reinterpret_cast<const char *>(&frame.Rotation),
+                              sizeof(frame.Rotation));
+                outFile.write(reinterpret_cast<const char *>(frame.Bones), sizeof(frame.Bones));
+            }
+        }
+        outFile.close();
+    }
+}
+
+void LoadRecordings() {
+    std::string path = GetAppDataPath() + "recordings.dat";
+    std::ifstream inFile(path, std::ios::binary);
+    if (inFile.is_open()) {
+        size_t recordingCount;
+        inFile.read(reinterpret_cast<char *>(&recordingCount), sizeof(recordingCount));
+
+        recordings.clear();
+        for (size_t i = 0; i < recordingCount; ++i) {
+            Dolly::Recording recording;
+            inFile.read(reinterpret_cast<char *>(&recording.StartFrame),
+                        sizeof(recording.StartFrame));
+            inFile.read(reinterpret_cast<char *>(&recording.Character),
+                        sizeof(recording.Character));
+            size_t frameCount;
+            inFile.read(reinterpret_cast<char *>(&frameCount), sizeof(frameCount));
+            recording.Frames.resize(frameCount);
+            for (size_t j = 0; j < frameCount; ++j) {
+                inFile.read(reinterpret_cast<char *>(&recording.Frames[j].Position),
+                            sizeof(recording.Frames[j].Position));
+                inFile.read(reinterpret_cast<char *>(&recording.Frames[j].Rotation),
+                            sizeof(recording.Frames[j].Rotation));
+                inFile.read(reinterpret_cast<char *>(recording.Frames[j].Bones),
+                            sizeof(recording.Frames[j].Bones));
+            }
+            recordings.push_back(recording);
+        }
+        inFile.close();
     }
 }
 
@@ -457,7 +670,7 @@ static void OnTick(float) {
 }
 
 static void OnRender(IDirect3DDevice9 *device) {
-    if (!playing) {
+    if (!playing && pathDisplay) {
         auto window = ImGui::BeginRawScene("##dolly-backbuffer");
 
         if (markers.size() > 1) {
@@ -509,7 +722,83 @@ static void OnRender(IDirect3DDevice9 *device) {
     }
 }
 
+static void OnInput(unsigned int &msg, int keycode) {
+    if (msg == WM_KEYDOWN) {
+        if (keycode == MarkerKeybind) {
+            AddMarker();
+        }
+
+        if (keycode == JumpFramesKeybind && !(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+            JumpFrames(FrameJumpAmount);
+        }
+        if (keycode == JumpFramesKeybind && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+            JumpFrames(-FrameJumpAmount);
+        }
+
+         if (keycode == FOVKeybindU) {
+            auto fov(FOVDegAmount);
+        }
+        if (keycode == FOVKeybindD) {
+            auto fov(-FOVDegAmount);
+        }
+        
+        if (keycode == RollKeybindU) {
+            auto roll(RollDegAmount);
+        }
+        if (keycode == RollKeybindD) {
+            auto roll(-RollDegAmount);
+        }
+
+        if (keycode == StartStopKeybind) {
+            if (playing) {
+                playing = false;
+                FixPlayer();
+            } else if(!playing){
+                if (frame >= duration) {
+                    frame = 0;
+                }
+
+                playing = true;
+                FixPlayer();
+            }
+        }
+
+        if (keycode == RecordKeybind) {
+            if (recording) {
+                recording = false;
+                recordings.push_back(currentRecording);
+                currentRecording.Frames.clear();
+                currentRecording.Frames.shrink_to_fit();
+                FixTimeline();
+            } else {
+                currentRecording.StartFrame = frame;
+                currentRecording.Character = character;
+                Engine::SpawnCharacter(currentRecording.Character, currentRecording.Actor);
+                recording = true;
+            }
+        }
+    }
+}
+
+Dolly::~Dolly() { // IF I REMOVE THIS FUNCTION, THE GAME CRASHES ON EXIT
+   // Ensure proper cleanup of resources
+   //markers.clear();
+   //recordings.clear();
+   //currentRecording.Frames.clear();
+   if (forceRollPatch) {
+       //VirtualProtect(forceRollPatch, sizeof(forceRollPatchOriginal), PAGE_EXECUTE_READWRITE, &oldProtect);
+       //memcpy(forceRollPatch, forceRollPatchOriginal, sizeof(forceRollPatchOriginal));
+   }
+}
+
 bool Dolly::Initialize() {
+
+    MarkerKeybind = Settings::GetSetting({"Dolly", "Tools", "MarkerKeybind"}, VK_F5);
+    JumpFramesKeybind = Settings::GetSetting({"Dolly", "Tools", "JumpFramesKeybind"}, VK_F6);
+    RecordKeybind = Settings::GetSetting({"Dolly", "Tools", "RecordKeybind"}, VK_F9);
+    StartStopKeybind = Settings::GetSetting({"Dolly", "Tools", "StartStopKeybind"}, VK_F9);
+    FrameJumpAmount = Settings::GetSetting({"Dolly", "Tools", "FrameJumpAmount"}, 100);
+
     forceRollPatch = Pattern::FindPattern("\x89\x93\x00\x00\x00\x00\xA1\x00\x00\x00\x00\x83\xB8",
                                           "xx????x????xx");
     if (!forceRollPatch) {
@@ -529,6 +818,7 @@ bool Dolly::Initialize() {
     Menu::AddTab("Dolly", DollyTab);
     Engine::OnTick(OnTick);
     Engine::OnRenderScene(OnRender);
+    Engine::OnInput(OnInput);
 
     Engine::OnActorTick([](Classes::AActor *actor) {
         if (!actor) {
